@@ -2666,7 +2666,7 @@ decodeSharedTransaction
     -> Handler (ApiDecodedTransaction n)
 decodeSharedTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed) _) = do
     era <- liftIO $ NW.currentNodeEra nl
-    let (decodedTx, _toMint, _toBurn, _allCerts, interval, _witsCount) =
+    let (decodedTx, _toMint, _toBurn, _allCerts, interval, witsCount) =
             decodeTx tl era sealed
     let (Tx { txId
             , fee
@@ -2710,6 +2710,7 @@ decodeSharedTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed) _
         , metadata = ApiTxMetadata $ ApiT <$> metadata
         , scriptValidity = ApiT <$> scriptValidity
         , validityInterval = interval
+        , witnessCount = witsCount
         }
   where
     tl = ctx ^. W.transactionLayer @k @'CredFromScriptK
@@ -2802,7 +2803,7 @@ decodeTransaction
     -> Handler (ApiDecodedTransaction n)
 decodeTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed) _) = do
     era <- liftIO $ NW.currentNodeEra nl
-    let (decodedTx, toMint, toBurn, allCerts, interval, _witsCount) =
+    let (decodedTx, toMint, toBurn, allCerts, interval, witsCount) =
             decodeTx tl era sealed
         Tx { txId
             , fee
