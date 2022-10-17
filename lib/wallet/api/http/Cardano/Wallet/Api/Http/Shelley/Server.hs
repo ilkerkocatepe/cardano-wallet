@@ -2850,6 +2850,7 @@ decodeTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed) _) = do
             , metadata = ApiTxMetadata $ ApiT <$> metadata
             , scriptValidity = ApiT <$> scriptValidity
             , validityInterval = interval
+            , witnessCount = witsCount
             }
   where
     tl = ctx ^. W.transactionLayer @k @'CredFromKeyK
