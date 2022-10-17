@@ -3029,8 +3029,9 @@ isForeign apiDecodedTx =
         all isWdrlForeign generalWdrls
 
 submitSharedTransaction
-    :: forall ctx s k.
+    :: forall ctx s k (n :: NetworkDiscriminant).
         ( ctx ~ ApiLayer s k 'CredFromScriptK
+        , s ~ SharedState n k
         , HasNetworkLayer IO ctx
         , IsOwned s k 'CredFromScriptK
         )
@@ -3051,15 +3052,23 @@ submitSharedTransaction ctx apiw@(ApiT wid) apitx = do
     let ourOuts = getOurOuts apiDecoded
     let ourInps = getOurInps apiDecoded
 
-    let witsRequiredForInputs = length $ L.nubBy samePaymentKey $
-            filter isInpOurs $
-            (apiDecoded ^. #inputs) ++ (apiDecoded ^. #collateral)
-    let totalNumberOfWits = length $ getSealedTxWitnesses sealedTx
-    when (witsRequiredForInputs > totalNumberOfWits) $
-        liftHandler $ throwE $
-        ErrSubmitTransactionPartiallySignedOrNoSignedTx witsRequiredForInputs totalNumberOfWits
-
     _ <- withWorkerCtx ctx wid liftE liftE $ \wrk -> do
+
+        (cp, _, _) <- liftHandler $ withExceptT ErrSubmitTransactionNoSuchWallet $
+            W.readWallet @_ @s @k wrk wid
+        let (ScriptTemplate _ script) = (Shared.paymentTemplate $ getState cp)
+        let witsPerInput = Shared.estimateWitnessRequiredPerInput script
+
+        let witsRequiredForInputs =
+                length $ L.nubBy samePaymentKey $
+                filter isInpOurs $
+                (apiDecoded ^. #inputs) ++ (apiDecoded ^. #collateral)
+        let totalNumberOfWits = length $ getSealedTxWitnesses sealedTx
+        let allWitsRequired = witsPerInput * witsRequiredForInputs
+        when (allWitsRequired > totalNumberOfWits) $
+            liftHandler $ throwE $
+            ErrSubmitTransactionPartiallySignedOrNoSignedTx allWitsRequired totalNumberOfWits
+
         let txCtx = defaultTransactionCtx
                 { txValidityInterval = (Nothing, ttl)
                 }
