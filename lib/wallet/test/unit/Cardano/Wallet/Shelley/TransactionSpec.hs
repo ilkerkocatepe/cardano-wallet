@@ -30,12 +30,7 @@ import Prelude
 import Cardano.Address.Derivation
     ( XPrv, XPub, toXPub, xprvFromBytes, xprvToBytes, xpubPublicKey )
 import Cardano.Address.Script
-    ( KeyHash (..)
-    , KeyRole (Delegation, Payment)
-    , Script
-    , foldScript
-    , serializeScript
-    )
+    ( KeyHash (..), KeyRole (Delegation, Payment), Script, serializeScript )
 import Cardano.Api
     ( AnyCardanoEra (..)
     , CardanoEra (..)
@@ -128,6 +123,8 @@ import Cardano.Wallet.Primitive.AddressDerivation.Shelley
     ( ShelleyKey, generateKeyFromSeed )
 import Cardano.Wallet.Primitive.AddressDiscovery.Sequential
     ( SeqState, defaultAddressPoolGap, mkSeqStateFromRootXPrv, purposeCIP1852 )
+import Cardano.Wallet.Primitive.AddressDiscovery.Shared
+    ( estimateMaxWitnessRequiredPerInput )
 import Cardano.Wallet.Primitive.Model
     ( Wallet (..), unsafeInitWallet )
 import Cardano.Wallet.Primitive.Passphrase
@@ -1209,7 +1206,8 @@ feeCalculationSpec era = describe "fee calculations" $ do
         $ property $ \scripts ->
         let
             -- Number of signatures required in the script
-            numWitnesses = sum $ (foldScript (const (+ 1)) 0) <$> scripts
+            numWitnesses = fromIntegral $ sum $
+                estimateMaxWitnessRequiredPerInput <$> scripts
             sizeWitness  =    1 -- small array
                            + 34 -- vkey
                            + 66 -- signature
@@ -1373,7 +1371,8 @@ feeCalculationSpec era = describe "fee calculations" $ do
             $ property $ \scripts ->
             let
                 -- Number of signatures required in the script
-                numWitnesses = sum $ (foldScript (const (+ 1)) 0) <$> scripts
+                numWitnesses = fromIntegral $ sum $
+                    estimateMaxWitnessRequiredPerInput <$> scripts
                 sizeWitness  =    1 -- small array
                                + 34 -- vkey
                                + 66 -- signature
