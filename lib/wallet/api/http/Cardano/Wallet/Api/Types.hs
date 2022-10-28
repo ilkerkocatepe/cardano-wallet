@@ -84,7 +84,10 @@ module Cardano.Wallet.Api.Types
     , ApiDeregisterPool (..)
     , ApiEra (..)
     , ApiEraInfo (..)
-    , ApiErrorCode (..)
+    , ApiError (..)
+    , ApiErrorInfo (..)
+    , ApiErrorMessage (..)
+    , ApiErrorTxOutputLovelaceInsufficient (..)
     , ApiExternalCertificate (..)
     , ApiExternalInput (..)
     , ApiFee (..)
@@ -403,6 +406,8 @@ import Control.DeepSeq
     ( NFData (..) )
 import Control.Monad
     ( guard, when, (<=<), (>=>) )
+import Data.Aeson.Extra
+    ( objectUnion )
 import Data.Aeson.Types
     ( FromJSON (..)
     , Parser
@@ -454,6 +459,8 @@ import Data.List.NonEmpty
     ( NonEmpty (..) )
 import Data.Map.Strict
     ( Map )
+import Data.Maybe
+    ( fromMaybe )
 import Data.Proxy
     ( Proxy (..) )
 import Data.Quantity
@@ -1631,8 +1638,27 @@ data ApiSharedWalletPatchData = ApiSharedWalletPatchData
     deriving (Eq, Generic, Show)
     deriving anyclass NFData
 
--- | Error codes returned by the API, in the form of snake_cased strings
-data ApiErrorCode
+data ApiError = ApiError
+    { info :: !ApiErrorInfo
+    , message :: !ApiErrorMessage
+    }
+    deriving (Eq, Generic, Show)
+    deriving anyclass NFData
+
+instance ToJSON ApiError where
+    toJSON ApiError {info, message}
+        = fromMaybe (error "ToJSON ApiError: Unexpected encoding")
+        $ toJSON info `objectUnion` toJSON message
+
+instance FromJSON ApiError where
+    parseJSON o = ApiError <$> parseJSON o <*> parseJSON o
+
+newtype ApiErrorMessage = ApiErrorMessage {message :: Text}
+    deriving (Eq, Generic, Show)
+    deriving (FromJSON, ToJSON) via DefaultRecord ApiErrorMessage
+    deriving anyclass NFData
+
+data ApiErrorInfo
     = AddressAlreadyExists
     | AlreadyWithdrawing
     | AssetNameTooLong
@@ -1713,7 +1739,7 @@ data ApiErrorCode
     | UnresolvedInputs
     | InputResolutionConflicts
     | UnsupportedMediaType
-    | UtxoTooSmall
+    | UtxoTooSmall ApiErrorTxOutputLovelaceInsufficient
     | WalletAlreadyExists
     | WalletNotResponding
     | WithdrawalNotWorth
@@ -1721,6 +1747,33 @@ data ApiErrorCode
     | WrongMnemonic
     | ValidityIntervalNotInsideScriptTimelock
     deriving (Eq, Generic, Show, Data, Typeable)
+    deriving anyclass NFData
+
+instance FromJSON ApiErrorInfo where
+    parseJSON = genericParseJSON apiErrorInfoOptions
+
+instance ToJSON ApiErrorInfo where
+    toJSON = genericToJSON apiErrorInfoOptions
+
+apiErrorInfoOptions :: Aeson.Options
+apiErrorInfoOptions = defaultSumTypeOptions
+    { sumEncoding = TaggedObject
+        { tagFieldName = "code"
+        , contentsFieldName = "info"
+        }
+    }
+
+data ApiErrorTxOutputLovelaceInsufficient = ApiErrorTxOutputLovelaceInsufficient
+    { txOutputIndex
+        :: !Word32
+    , txOutputLovelaceSpecified
+        :: !(Quantity "lovelace" Natural)
+    , txOutputLovelaceRequiredMinimum
+        :: !(Quantity "lovelace" Natural)
+    }
+    deriving (Data, Eq, Generic, Show, Typeable)
+    deriving (FromJSON, ToJSON)
+        via DefaultRecord ApiErrorTxOutputLovelaceInsufficient
     deriving anyclass NFData
 
 -- | Defines a point in time that can be formatted as and parsed from an
@@ -2783,8 +2836,6 @@ instance FromJSON ApiSharedWallet where
 instance ToJSON ApiSharedWallet where
     toJSON (ApiSharedWallet (Left c))= toJSON c
     toJSON (ApiSharedWallet (Right c))= toJSON c
-
-deriving via DefaultSum ApiErrorCode instance ToJSON ApiErrorCode
 
 -- | Options for encoding synchronization progress. It can be serialized to
 -- and from JSON as follows:
