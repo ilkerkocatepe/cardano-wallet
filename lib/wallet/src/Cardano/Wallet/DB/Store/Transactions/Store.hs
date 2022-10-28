@@ -1,8 +1,8 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE RankNTypes #-}
-
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -25,6 +25,7 @@ import Prelude
 
 import Cardano.Wallet.DB.Sqlite.Schema
     ( CBOR (..)
+    , CBOR (..)
     , EntityField (..)
     , TxCollateral (..)
     , TxCollateralOut (..)
@@ -46,6 +47,8 @@ import Cardano.Wallet.DB.Store.Transactions.Model
     )
 import Control.Arrow
     ( Arrow ((&&&)) )
+import Control.Monad.Reader
+    ( MonadIO, ReaderT )
 import Data.DBVar
     ( Store (..) )
 import Data.Foldable
@@ -59,11 +62,14 @@ import Data.List.Split
 import Data.Map.Strict
     ( Map )
 import Data.Maybe
-    ( maybeToList )
+    ( listToMaybe, maybeToList )
 import Data.Monoid
     ( First (..), getFirst )
 import Database.Persist.Sql
-    ( Entity
+    ( BaseBackend
+    , Entity
+    , PersistEntity (PersistEntityBackend)
+    , PersistQueryRead
     , SqlPersistT
     , deleteWhere
     , entityVal
@@ -142,17 +148,17 @@ selectTxSet = TxSet <$> select
         outputs <- mkMap txOutputTxId selectListAll
         collateralOutputs
             <- fmap getFirst <$> mkMap txCollateralOutTxId selectListAll
-        widths <- mkMap txWithdrawalTxId selectListAll
+        withs <- mkMap txWithdrawalTxId selectListAll
         outTokens <- mkMap txOutTokenTxId selectListAll
         collateralTokens <- mkMap txCollateralOutTokenTxId selectListAll
-        cbors :: Map TxId (First  CBOR) <- mkMap cborTxId selectListAll
+        cbors <- mkMap cborTxId selectListAll
         let ids =
                 fold
                     [Map.keysSet inputs
                    , Map.keysSet collaterals
                    , Map.keysSet outputs
                    , Map.keysSet collateralOutputs
-                   , Map.keysSet widths
+                   , Map.keysSet withs
                    , Map.keysSet outTokens
                    , Map.keysSet collateralTokens
                     ]
@@ -170,7 +176,7 @@ selectTxSet = TxSet <$> select
                 $ TxRelation
                 { ins = sortOn txInputOrder $ orEmpty k inputs
                 , collateralIns = sortOn txCollateralOrder
-                      $ orEmpty k collaterals
+                    $ orEmpty k collaterals
                 , outs = fmap (fmap $ sortOn tokenOutOrd)
                       $ sortOn (txOutputIndex . fst)
                       $ (id &&& selectOutTokens k)
@@ -178,55 +184,9 @@ selectTxSet = TxSet <$> select
                 , collateralOuts = fmap (fmap $ sortOn tokenCollateralOrd)
                       $ (id &&& selectCollateralTokens k)
                       <$> Map.findWithDefault Nothing k collateralOutputs
-                , withdrawals = sortOn txWithdrawalAccount $ orEmpty k widths
+                , withdrawals = sortOn txWithdrawalAccount $ orEmpty k withs
                 , cbor = getFirst $ Map.findWithDefault (First Nothing) k cbors
                 }
-
--- -- | Select one transaction from the database.
--- selectTx :: TxId -> SqlPersistT IO (Maybe TxRelation)
--- selectTx k = select
---   where
---     selectK
---         :: (PersistEntityBackend record ~ BaseBackend backend)
---         =>  EntityField record TxId
---         -> ReaderT backend m [Entity record]
---     selectK f = selectList [f ==. k] []
---     select :: SqlPersistT IO (Maybe TxRelation)
---     select = do
---         inputs <- mkMap txInputTxId $ selectK TxInputTxId
---         collaterals <- mkMap txCollateralTxId $ selectK TxCollateralTxId
---         outputs <- mkMap txOutputTxId $ selectK TxOutputTxId
---         collateralOutputs
---             <- fmap getFirst
---                 <$> mkMap txCollateralOutTxId (selectK TxCollateralOutTxId)
---         withdrawals <- mkMap txWithdrawalTxId $ selectK TxWithdrawalTxId
---         outTokens <- mkMap txOutTokenTxId $ selectK TxOutTokenTxId
---         collateralTokens <- mkMap txCollateralOutTokenTxId
---             $ selectK TxCollateralOutTokenTxId
---         let
---             selectOutTokens :: TxId -> TxOut -> [TxOutToken]
---             selectOutTokens txId txOut =
---                 filter
---                     (\token -> txOutTokenTxIndex token == txOutputIndex txOut)
---                 $ Map.findWithDefault [] txId outTokens
---             selectCollateralTokens
---                 :: TxId -> TxCollateralOut -> [TxCollateralOutToken]
---             selectCollateralTokens txId _ =
---                 Map.findWithDefault [] txId collateralTokens
---         pure $ Just $ TxRelation
---                 { ins = sortOn txInputOrder $ inputs
---                 , collateralIns = sortOn txCollateralOrder
---                       $ collaterals
---                 , outs = fmap (fmap $ sortOn tokenOutOrd)
---                       $ sortOn (txOutputIndex . fst)
---                       $ (id &&& selectOutTokens k)
---                       <$> outputs
---                 , collateralOuts = fmap (fmap $ sortOn tokenCollateralOrd)
---                       $ (id &&& selectCollateralTokens k)
---                       <$> collateralOutputs
---                 , withdrawals = sortOn txWithdrawalAccount
---                       $ withdrawals
---                 }
 
 mkMap :: (Ord k, Functor f, Applicative g, Semigroup (g b))
     => (b -> k)
@@ -237,8 +197,43 @@ mkMap k v =
     . fmap ((k &&& pure) . entityVal)
     <$> v
 
+-- | Select one transaction from the database.
 selectTx :: TxId -> SqlPersistT IO (Maybe TxRelation)
-selectTx = undefined
+selectTx k = select
+  where
+    selectK
+        :: (MonadIO m, PersistEntityBackend record ~ BaseBackend backend
+            , PersistQueryRead backend, PersistEntity record)
+        => EntityField record TxId
+        -> ReaderT backend m [record]
+    selectK f = fmap entityVal <$> selectList [f ==. k] []
+    select :: SqlPersistT IO (Maybe TxRelation)
+    select = do
+        inputs <- selectK TxInputTxId
+        collaterals <- selectK TxCollateralTxId
+        outputs <- selectK TxOutputTxId
+        collateralOutputs <-  selectK TxCollateralOutTxId
+        withds <- selectK TxWithdrawalTxId
+        outTokens <- selectK TxOutTokenTxId
+        collateralTokens <- selectK TxCollateralOutTokenTxId
+        mcbor <- selectK CborTxId
+        let
+            selectOutTokens :: TxOut -> [TxOutToken]
+            selectOutTokens txOut = filter
+                (\token -> txOutTokenTxIndex token == txOutputIndex txOut)
+                outTokens
+        pure $ Just $ TxRelation
+                { ins = sortOn txInputOrder inputs
+                , collateralIns = sortOn txCollateralOrder collaterals
+                , outs = fmap (fmap $ sortOn tokenOutOrd)
+                    $ sortOn (txOutputIndex . fst)
+                    $ (id &&& selectOutTokens)
+                    <$> outputs
+                , collateralOuts = listToMaybe collateralOutputs
+                    <&> (, sortOn tokenCollateralOrd collateralTokens)
+                , withdrawals = sortOn txWithdrawalAccount withds
+                , cbor = listToMaybe mcbor
+                }
 
 -- | A database layer that stores transactions.
 data DBTxSet stm = DBTxSet
@@ -248,6 +243,7 @@ data DBTxSet stm = DBTxSet
         :: DeltaTxSet -> stm ()
     }
 
+-- | Create a 'DBTxSet' specialized for sqlite backend
 mkDBTxSet :: DBTxSet (SqlPersistT IO)
 mkDBTxSet = DBTxSet
     {   getTxById = selectTx
