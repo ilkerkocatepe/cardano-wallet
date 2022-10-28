@@ -540,7 +540,7 @@ import Data.Functor
 import Data.Functor.Identity
     ( Identity (..) )
 import Data.Generics.Internal.VL.Lens
-    ( Lens', view, (.~), (^.) )
+    ( Lens', set, view, (.~), (^.) )
 import Data.Generics.Labels
     ()
 import Data.List
@@ -2146,7 +2146,7 @@ mkApiTransactionFromInfo ti wrk wid deposit info metadataSchema = do
   where
     drop2nd (a,_,c) = (a,c)
     status :: Lens' (ApiTransaction n) (Maybe ApiBlockReference)
-    status = case info ^. (#txInfoMeta . #status) of
+    status = case info ^. #txInfoMeta . #status of
         Pending  -> #pendingSince
         InLedger -> #insertedAt
         Expired  -> #pendingSince
@@ -3540,7 +3540,7 @@ migrateWallet ctx withdrawalType (ApiT wid) postData = do
             mkApiTransaction
                 (timeInterpreter (ctx ^. networkLayer))
                 wrk wid
-                (#pendingSince)
+                #pendingSince
                 MkApiTransactionParams
                     { txId = tx ^. #txId
                     , txFee = tx ^. #fee
@@ -4050,8 +4050,6 @@ data MkApiTransactionParams = MkApiTransactionParams
     }
     deriving (Eq, Generic, Show)
 
-
-
 mkApiTransaction
     :: forall n s k . (Typeable s, Typeable n, HasDelegation s)
     => TimeInterpreter (ExceptT PastHorizonException IO)
@@ -4060,55 +4058,34 @@ mkApiTransaction
     -> Lens' (ApiTransaction n) (Maybe ApiBlockReference)
     -> MkApiTransactionParams
     -> Handler (ApiTransaction n)
-mkApiTransaction timeInterpreter wrk wid setTimeReference tx = do
-    timeRef <- liftIO $ (#time .~ (tx ^. #txTime)) <$> makeApiBlockReference
-            (neverFails
-                "makeApiBlockReference shouldn't fail getting the time of \
-                \transactions with slots in the past" timeInterpreter)
-            (tx ^. (#txMeta . #slotNo))
-            (natural (tx ^. (#txMeta . #blockHeight)))
-    expRef <- liftIO $
-        traverse makeApiSlotReference' (tx ^. (#txMeta . #expiry))
-
+mkApiTransaction timeInterpreter wrk wid timeRefLens tx = do
+    timeRef <- liftIO $ (#time .~ tx ^. #txTime) <$> makeApiBlockReference
+        (neverFails
+            "makeApiBlockReference shouldn't fail getting the time of \
+            \transactions with slots in the past" timeInterpreter)
+        (tx ^. #txMeta . #slotNo)
+        (natural (tx ^. #txMeta . #blockHeight))
+    expRef <- liftIO $ traverse makeApiSlotReference' (tx ^. #txMeta . #expiry)
     parsedValues <- traverse parseTxCBOR $ tx ^. #txCBOR
     parsedCertificates <- if hasDelegation (Proxy @s)
         then traverse (getApiAnyCertificates wrk wid) parsedValues
         else pure Nothing
     parsedMintBurn <- forM parsedValues
         $ getTxApiAssetMintBurn @_ @s @k @n wrk wid
-    let parsedValidity = view #validityInterval =<< parsedValues
-        parsedIntegrity = view #scriptIntegrity =<< parsedValues
-        parsedExtraSigs = view #extraSignatures <$> parsedValues
 
-    return $
-        apiTx
-            & setTimeReference .~ Just timeRef
-            & #expiresAt .~ expRef
-            & #certificates .~ fromMaybe [] parsedCertificates
-            & #mint  .~ maybe noApiAsset fst parsedMintBurn
-            & #burn  .~ maybe noApiAsset snd parsedMintBurn
-            & #validityInterval .~ parsedValidity
-            & #scriptIntegrity .~ (ApiT <$> parsedIntegrity)
-            & #extraSignatures .~ maybe [] (fmap ApiT) parsedExtraSigs
-  where
-    -- Since tx expiry can be far in the future, we use unsafeExtendSafeZone for
-    -- now.
-    makeApiSlotReference' = makeApiSlotReference
-        $ unsafeExtendSafeZone timeInterpreter
-    apiTx :: ApiTransaction n
-    apiTx = ApiTransaction
+    pure $ set timeRefLens (Just timeRef) $ ApiTransaction
         { id = ApiT $ tx ^. #txId
-        , amount = Quantity . fromIntegral $ tx ^. (#txMeta . #amount . #unCoin)
+        , amount = Quantity . fromIntegral $ tx ^. #txMeta . #amount . #unCoin
         , fee = Quantity $ maybe 0 (fromIntegral . unCoin) (tx ^. #txFee)
         , depositTaken = Quantity depositIfAny
         , depositReturned = Quantity reclaimIfAny
         , insertedAt = Nothing
         , pendingSince = Nothing
-        , expiresAt = Nothing
+        , expiresAt = expRef
         , depth = Nothing
-        , direction = ApiT (tx ^. (#txMeta . #direction))
+        , direction = ApiT (tx ^. #txMeta . #direction)
         , inputs =
-            [ ApiTxInput (fmap (toAddressAmount @n) o) (ApiT i)
+            [ ApiTxInput (toAddressAmount @n <$> o) (ApiT i)
             | (i, o) <- tx ^. #txInputs
             ]
         , collateral =
@@ -4119,18 +4096,24 @@ mkApiTransaction timeInterpreter wrk wid setTimeReference tx = do
         , collateralOutputs = ApiAsArray $
             toAddressAmount @n <$> tx ^. #txCollateralOutput
         , withdrawals = mkApiWithdrawal @n <$> Map.toList (tx ^. #txWithdrawals)
-        , status = ApiT (tx ^. (#txMeta . #status))
-        , metadata = TxMetadataWithSchema (tx ^. #txMetadataSchema)
-            <$> tx ^. #txMetadata
+        , status = ApiT (tx ^. #txMeta . #status)
+        , metadata =
+            TxMetadataWithSchema (tx ^. #txMetadataSchema) <$> tx ^. #txMetadata
         , scriptValidity = ApiT <$> tx ^. #txScriptValidity
-        , certificates = []
-        , mint = ApiAssetMintBurn [] Nothing Nothing
-        , burn = ApiAssetMintBurn [] Nothing Nothing
-        , validityInterval = Nothing
-        , scriptIntegrity = Nothing
-        , extraSignatures = []
+        , certificates = fromMaybe [] parsedCertificates
+        , mint = maybe noApiAsset fst parsedMintBurn
+        , burn = maybe noApiAsset snd parsedMintBurn
+        , validityInterval = view #validityInterval =<< parsedValues
+        , scriptIntegrity =
+            ApiT <$> (view #scriptIntegrity =<< parsedValues)
+        , extraSignatures =
+            ApiT <$> (view #extraSignatures =<< maybe [] pure parsedValues)
         }
-
+  where
+    -- Since tx expiry can be far in the future, we use unsafeExtendSafeZone for
+    -- now.
+    makeApiSlotReference' = makeApiSlotReference
+        $ unsafeExtendSafeZone timeInterpreter
     depositIfAny :: Natural
     depositIfAny
         | tx ^. (#txMeta . #direction) == W.Outgoing =
@@ -4233,7 +4216,7 @@ makeApiBlockReference
 makeApiBlockReference ti sl height = do
     slotId <- interpretQuery ti (toSlotId sl)
     slotTime <- interpretQuery ti (slotToUTCTime sl)
-    return $ ApiBlockReference
+    pure ApiBlockReference
         { absoluteSlotNumber = ApiT sl
         , slotId = apiSlotId slotId
         , time = slotTime
