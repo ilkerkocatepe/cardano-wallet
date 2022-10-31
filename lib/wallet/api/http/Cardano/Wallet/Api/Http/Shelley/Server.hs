@@ -192,7 +192,7 @@ import Cardano.Wallet.Api
     , workerRegistry
     )
 import Cardano.Wallet.Api.Http.Server.Error
-    ( IsServerError (..), apiError, liftE, liftHandler )
+    ( IsServerError (..), apiError, handleWalletException, liftE, liftHandler )
 import Cardano.Wallet.Api.Http.Server.Handlers.Certificates
     ( getApiAnyCertificates )
 import Cardano.Wallet.Api.Http.Server.Handlers.MintBurn
@@ -338,7 +338,7 @@ import Cardano.Wallet.CoinSelection
 import Cardano.Wallet.Compat
     ( (^?) )
 import Cardano.Wallet.DB
-    ( DBFactory (..) )
+    ( DBFactory (..), DBLayer )
 import Cardano.Wallet.Network
     ( NetworkLayer (..), fetchRewardAccountBalances, timeInterpreter )
 import Cardano.Wallet.Pools
@@ -543,6 +543,8 @@ import Data.Generics.Internal.VL.Lens
     ( Lens', set, view, (.~), (^.) )
 import Data.Generics.Labels
     ()
+import Data.Generics.Product
+    ( typed )
 import Data.List
     ( isInfixOf, sortOn, (\\) )
 import Data.List.NonEmpty
@@ -614,7 +616,7 @@ import UnliftIO.Async
 import UnliftIO.Concurrent
     ( threadDelay )
 import UnliftIO.Exception
-    ( IOException, bracket, throwIO, tryAnyDeep, tryJust )
+    ( IOException, bracket, tryAnyDeep, tryJust )
 
 import qualified Cardano.Api as Cardano
 import qualified Cardano.Wallet as W
@@ -866,9 +868,10 @@ mkShelleyWallet
         )
     => MkApiWallet ctx s ApiWallet
 mkShelleyWallet ctx wid cp meta pending progress = do
-    reward <- withWorkerCtx @_ @s @k ctx wid liftE liftE $ \wrk ->
+    reward <- withWorkerCtx @_ @s @k ctx wid liftE liftE $ \wrk -> do
+        let db = wrk ^. typed @(DBLayer IO s k)
         -- never fails - returns zero if balance not found
-        liftIO $ W.fetchRewardBalance @_ @s @k wrk wid
+        liftIO $ W.fetchRewardBalance @s @k db wid
 
     let ti = timeInterpreter $ ctx ^. networkLayer
 
@@ -1066,9 +1069,10 @@ mkSharedWallet ctx wid cp meta pending progress = case Shared.ready st of
         , delegationScriptTemplate = Shared.delegationTemplate st
         }
     Shared.Active _ -> do
-        reward <- withWorkerCtx @_ @s @k ctx wid liftE liftE $ \wrk ->
+        reward <- withWorkerCtx @_ @s @k ctx wid liftE liftE $ \wrk -> do
+            let db = wrk ^. typed @(DBLayer IO s k)
             -- never fails - returns zero if balance not found
-            liftIO $ W.fetchRewardBalance @_ @s @k wrk wid
+            liftIO $ W.fetchRewardBalance @s @k db wid
 
         let ti = timeInterpreter $ ctx ^. networkLayer
         apiDelegation <- liftIO $ toApiWalletDelegation (meta ^. #delegation)
@@ -1687,9 +1691,10 @@ selectCoinsForJoin ctx knownPools getPoolStatus pid wid = do
                 , selectionStrategy = SelectionStrategyOptimal
                 }
         utx <- liftHandler
-            $ W.selectAssets @_ @_ @s @k @'CredFromKeyK wrk era pp selectAssetsParams transform
+            $ W.selectAssets @_ @_ @s @k @'CredFromKeyK
+                wrk era pp selectAssetsParams transform
         (_, _, path) <- liftHandler
-            $ W.readRewardAccount @_ @s @k @n wrk wid
+            $ W.readRewardAccount @s @k @n (wrk ^. typed @(DBLayer IO s k)) wid
 
         let deposits = maybeToList deposit
 
@@ -1707,9 +1712,10 @@ selectCoinsForQuit
     -> Handler (Api.ApiCoinSelection n)
 selectCoinsForQuit ctx (ApiT wid) = do
     withWorkerCtx ctx wid liftE liftE $ \wrk -> do
+        let db = wrk ^. typed @(DBLayer IO (SeqState n k) k)
         wdrl <- liftHandler $ mkSelfWithdrawal @_ @k @n wrk wid
-        action <- liftHandler
-            $ W.quitStakePool @_ @(SeqState n k) @k wrk wid wdrl
+        action <- handleWalletException
+            $ W.validatedQuitStakePoolAction @(SeqState n k) @k db wid wdrl
 
         let txCtx = defaultTransactionCtx
                 { txDelegationAction = Just action
@@ -1738,7 +1744,7 @@ selectCoinsForQuit ctx (ApiT wid) = do
             $ W.selectAssets @_ @_ @(SeqState n k) @k @'CredFromKeyK
                 wrk era pp selectAssetsParams transform
         (_, _, path) <- liftHandler
-            $ W.readRewardAccount @_ @(SeqState n k) @k @n wrk wid
+            $ W.readRewardAccount @(SeqState n k) @k @n db wid
 
         pure $ mkApiCoinSelection [] [refund] (Just (action, path)) Nothing utx
 
@@ -2288,6 +2294,7 @@ constructTransaction ctx genChange knownPools getPoolStatus (ApiT wid) body = do
         $ throwE ErrConstructTxValidityIntervalNotWithinScriptTimelock
 
     withWorkerCtx ctx wid liftE liftE $ \wrk -> do
+        let db = wrk ^. typed @(DBLayer IO s k)
         pp <- liftIO $ NW.currentProtocolParameters (wrk ^. networkLayer)
         era <- liftIO $ NW.currentNodeEra (wrk ^. networkLayer)
         wdrl <- case body ^. #withdrawal of
@@ -2313,8 +2320,8 @@ constructTransaction ctx genChange knownPools getPoolStatus (ApiT wid) body = do
                             @_ @s @k wrk curEpoch pools pid poolStatus wid
                         pure (del, act, Nothing)
                     [(Leaving _)] -> do
-                        del <- liftHandler $
-                            W.quitStakePool @_ @s @k wrk wid wdrl
+                        del <- handleWalletException $
+                            W.validatedQuitStakePoolAction @s @k db wid wdrl
                         pure (del, Nothing, Just $ W.stakeKeyDeposit pp)
                     _ ->
                         liftHandler $
@@ -2828,8 +2835,9 @@ decodeTransaction ctx (ApiT wid) (ApiSerialisedTransaction (ApiT sealed) _) = do
             , scriptValidity
             } = decodedTx
     withWorkerCtx ctx wid liftE liftE $ \wrk -> do
+        let db = wrk ^. typed @(DBLayer IO s k)
         (acct, _, acctPath) <-
-            liftHandler $ W.readRewardAccount @_ @s @k @n wrk wid
+            liftHandler $ W.readRewardAccount @s @k @n db wid
         inputPaths <-
             liftHandler $ W.lookupTxIns @_ @s @k wrk wid $
             fst <$> resolvedInputs
@@ -2963,7 +2971,8 @@ submitTransaction ctx apiw@(ApiT wid) apitx = do
         ErrSubmitTransactionPartiallySignedOrNoSignedTx witsRequiredForInputs totalNumberOfWits
 
     _ <- withWorkerCtx ctx wid liftE liftE $ \wrk -> do
-        (acct, _, path) <- liftHandler $ W.readRewardAccount @_ @s @k @n wrk wid
+        let db = wrk ^. typed @(DBLayer IO s k)
+        (acct, _, path) <- liftHandler $ W.readRewardAccount @s @k @n db wid
         let wdrl = getOurWdrl acct path apiDecoded
         let txCtx = defaultTransactionCtx
                 { -- TODO: [ADP-1193]
@@ -3239,23 +3248,27 @@ quitStakePool
     -> ApiT WalletId
     -> ApiWalletPassphrase
     -> Handler (ApiTransaction n)
-quitStakePool ctx (ApiT wid) body = do
+quitStakePool ctx (ApiT walletId) body = do
     mkRwdAcct <- mkRewardAccountBuilder @s @_ @n (Just SelfWithdrawal)
-    withWorkerCtx ctx wid liftE liftE $ \wrk -> do
-        wdrl <- liftHandler $ mkSelfWithdrawal @_ @k @n wrk wid
-        action <- liftHandler $ W.quitStakePool wrk wid wdrl
+    withWorkerCtx ctx walletId liftE liftE $ \wrk -> do
+        let db = wrk ^. typed @(DBLayer IO s k)
+            netLayer = wrk ^. typed @(NetworkLayer IO Block)
+        (withdrawal, action) <- handleWalletException
+            $ W.quitStakePool @s @k @n netLayer db walletId
         ttl <- liftIO $ W.getTxExpiry ti Nothing
         let txCtx = defaultTransactionCtx
-                { txWithdrawal = wdrl
+                { txWithdrawal = withdrawal
                 , txValidityInterval = (Nothing, ttl)
                 , txDelegationAction = Just action
                 }
 
         (utxoAvailable, wallet, pendingTxs) <-
-            liftHandler $ W.readWalletUTxOIndex @_ @s @k wrk wid
+            liftHandler $ W.readWalletUTxOIndex @_ @s @k wrk walletId
         pp <- liftIO $ NW.currentProtocolParameters (wrk ^. networkLayer)
         era <- liftIO $ NW.currentNodeEra (wrk ^. networkLayer)
-        let selectAssetsParams = W.SelectAssetsParams
+        sel <- liftHandler
+            $ W.selectAssets @_ @_ @s @k @'CredFromKeyK wrk era pp
+                W.SelectAssetsParams
                 { outputs = []
                 , pendingTxs
                 , randomSeed = Nothing
@@ -3265,18 +3278,16 @@ quitStakePool ctx (ApiT wid) body = do
                 , wallet
                 , selectionStrategy = SelectionStrategyOptimal
                 }
-        sel <- liftHandler
-            $ W.selectAssets @_ @_ @s @k @'CredFromKeyK wrk era pp selectAssetsParams
             $ const Prelude.id
         sel' <- liftHandler
-            $ W.assignChangeAddressesAndUpdateDb wrk wid genChange sel
+            $ W.assignChangeAddressesAndUpdateDb wrk walletId genChange sel
         (tx, txMeta, txTime, sealedTx) <- do
             let pwd = coerce $ getApiT $ body ^. #passphrase
             liftHandler $ W.buildAndSignTransaction @_ @s @k
-                wrk wid era mkRwdAcct pwd txCtx sel'
+                wrk walletId era mkRwdAcct pwd txCtx sel'
         liftHandler
-            $ W.submitTx @_ @s @k wrk wid (tx, txMeta, sealedTx)
-        mkApiTransaction ti wrk wid #pendingSince
+            $ W.submitTx @_ @s @k wrk walletId (tx, txMeta, sealedTx)
+        mkApiTransaction ti wrk walletId #pendingSince
             MkApiTransactionParams
                 { txId = tx ^. #txId
                 , txFee = tx ^. #fee
@@ -3377,23 +3388,24 @@ listStakeKeys
     -> Handler (ApiStakeKeys n)
 listStakeKeys lookupStakeRef ctx (ApiT wid) = do
     withWorkerCtx ctx wid liftE liftE $ \wrk -> liftHandler $ do
-            (wal, meta, pending) <- W.readWallet @_ @s @k wrk wid
-            let utxo = availableUTxO @s pending wal
+        let db = wrk ^. typed @(DBLayer IO s k)
+        (wal, meta, pending) <- W.readWallet @_ @s @k wrk wid
+        let utxo = availableUTxO @s pending wal
 
-            let takeFst (a,_,_) = a
-            mourAccount <- fmap (fmap takeFst . eitherToMaybe)
-                <$> liftIO . runExceptT $ W.readRewardAccount @_ @s @k @n wrk wid
-            ourApiDelegation <- liftIO $ toApiWalletDelegation (meta ^. #delegation)
-                (unsafeExtendSafeZone (timeInterpreter $ ctx ^. networkLayer))
-            let ourKeys = case mourAccount of
-                    Just acc -> [(acc, 0, ourApiDelegation)]
-                    Nothing -> []
+        let takeFst (a,_,_) = a
+        mourAccount <- fmap (fmap takeFst . eitherToMaybe)
+            <$> liftIO . runExceptT $ W.readRewardAccount @s @k @n db wid
+        ourApiDelegation <- liftIO $ toApiWalletDelegation (meta ^. #delegation)
+            (unsafeExtendSafeZone (timeInterpreter $ ctx ^. networkLayer))
+        let ourKeys = case mourAccount of
+                Just acc -> [(acc, 0, ourApiDelegation)]
+                Nothing -> []
 
-            liftIO $ listStakeKeys' @n
-                utxo
-                lookupStakeRef
-                (fetchRewardAccountBalances nl)
-                ourKeys
+        liftIO $ listStakeKeys' @n
+            utxo
+            lookupStakeRef
+            (fetchRewardAccountBalances nl)
+            ourKeys
   where
     nl = ctx ^. networkLayer
 
@@ -3877,10 +3889,9 @@ mkSelfWithdrawal
     -> ExceptT ErrReadRewardAccount IO Withdrawal
 mkSelfWithdrawal workerCtx walletId = do
     let netLayer = workerCtx ^. networkLayer
-    (rewardAccount, _, derivationPath) <-
-        W.readRewardAccount @_ @s @k @n workerCtx walletId
-    withdrawalCoins <-
-        liftIO $ getCachedRewardAccountBalance netLayer rewardAccount
+        db = workerCtx ^. typed @(DBLayer IO s k)
+    (rewardAccount, _, derivationPath) <- W.readRewardAccount @s @k @n db walletId
+    withdrawalCoins <- liftIO $ getCachedRewardAccountBalance netLayer rewardAccount
     pure $ WithdrawalSelf rewardAccount derivationPath withdrawalCoins
 
 mkExternalWithdrawal
@@ -4327,8 +4338,7 @@ startWalletWorker
 startWalletWorker ctx coworker = void . registerWorker ctx before coworker
   where
     before ctx' wid =
-        runExceptT (W.checkWalletIntegrity ctx' wid gp)
-        >>= either throwIO pure
+        W.checkWalletIntegrity (ctx' ^. typed @(DBLayer IO s k)) wid gp
     (_, NetworkParameters gp _ _) = ctx ^. genesisData
 
 -- | Register a wallet create and restore thread with the worker registry.
